@@ -3,7 +3,7 @@ import triton.language as tl
 
 
 @triton.jit
-def argmax_kernel(
+def argmax_kernel_block(
     input_ptr: tl.tensor,
     output_ptr: tl.tensor,
     M: tl.constexpr,
@@ -37,6 +37,28 @@ def argmax_kernel(
     tl.store(output_ptr + offset_x, ids, mask=mask_x)
 
 
+@triton.jit
+def argmax_kernel(
+    input_ptr: tl.tensor,
+    output_ptr: tl.tensor,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    input_row_offset = pid % K + pid // K * M * K
+    col_offset = tl.arange(0, BLOCK_SIZE)
+
+    input_ptr += input_row_offset
+    mask = col_offset < M
+
+    input_values = tl.load(input_ptr + col_offset * K, mask=mask, other=-float("inf"))
+    current_max_id = tl.argmax(input_values, axis=0)
+
+    tl.store(output_ptr + pid, current_max_id)
+
+
 def solution(input, dim: int, output, shape, ndim: int):
     if dim < 0:
         dim += ndim
@@ -46,10 +68,17 @@ def solution(input, dim: int, output, shape, ndim: int):
     N = math.prod([shape[i].item() for i in range(dim)], start=1)
     K = math.prod([shape[i].item() for i in range(dim + 1, ndim)], start=1)
     M = shape[dim].item()
-    BLOCK_SIZE = 8
-    grid = lambda meta: (triton.cdiv(N * K, meta["BLOCK_SIZE"]),)
 
-    argmax_kernel[grid](input, output, M, N, BLOCK_SIZE, K)
+    if M * K > 4096:
+        BLOCK_SIZE = 256
+        grid = lambda meta: (triton.cdiv(N * K, meta["BLOCK_SIZE"]),)
+
+        argmax_kernel_block[grid](input, output, M, N, BLOCK_SIZE, K)
+    else:
+        BLOCK_SIZE = triton.next_power_of_2(N * K)
+        grid = lambda meta: (N * K,)
+
+        argmax_kernel[grid](input, output, M, N, BLOCK_SIZE, K)
 
 
 import torch
@@ -72,7 +101,7 @@ solution(input, dim=1, output=output, shape=torch.tensor(input.shape), ndim=inpu
 print(torch.argmax(input, dim=1))
 print(torch.max(input, dim=1).values)
 print(output)
-print(output_1)
+# print(output_1)
 # for dim in [0, 1, 2, -1]:
 #     expected = torch.argmax(input, dim=dim)
 #     actual = solution(input, dim=dim)
